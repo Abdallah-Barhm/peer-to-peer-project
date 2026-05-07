@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+
+import socket
+import threading
+import os
+import sys
+import json
+import hashlib
+import time
+from datetime import datetime
+
+try:
+    from colorama import init, Fore, Style
+    init()
+    C = {
+        'info': Fore.CYAN,
+        'ok': Fore.GREEN,
+        'err': Fore.RED,
+        'msg': Fore.YELLOW,
+        'file': Fore.MAGENTA,
+        'note': Fore.BLUE,
+        'reset': Style.RESET_ALL
+    }
+except ImportError:
+    C = {k: '' for k in ['info', 'ok', 'err', 'msg', 'file', 'note', 'reset']}
+
+
+class P2PStudentShare:
+    
+    def __init__(self, username, host='0.0.0.0', port=5555):
+        self.username = username
+        self.host = host
+        self.port = port
+        self.peers = {}
+        self.running = True
+        self.shared_dir = "shared_files"
+        self.notes_dir = "notes"
+        
+        os.makedirs(self.shared_dir, exist_ok=True)
+        os.makedirs(self.notes_dir, exist_ok=True)
+        
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        self.lock = threading.Lock()
+        
+    def start_server(self):
+        try:
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(10)
+            print(f"{C['info']}[✓] الخادم يعمل على {self.host}:{self.port}{C['reset']}")
+            
+            accept_thread = threading.Thread(target=self.accept_connections, daemon=True)
+            accept_thread.start()
+            
+        except Exception as e:
+            print(f"{C['err']}[✗] فشل تشغيل الخادم: {e}{C['reset']}")
+            
+    def accept_connections(self):
+        while self.running:
+            try:
+                client_socket, addr = self.server_socket.accept()
+                client_ip = addr[0]
+                
+                client_thread = threading.Thread(
+                    target=self.handle_peer, 
+                    args=(client_socket, client_ip),
+                    daemon=True
+                )
+                client_thread.start()
+                
+            except:
+                break
+                
+    def handle_peer(self, client_socket, peer_ip):
+        try:
+            while self.running:
+                data_size_bytes = client_socket.recv(10)
+                if not data_size_bytes:
+                    break
+                    
+                data_size = int(data_size_bytes.decode().strip())
+                
+                data = b''
+                while len(data) < data_size:
+                    chunk = client_socket.recv(min(data_size - len(data), 4096))
+                    if not chunk:
+                        break
+                    data += chunk
+                    
+                if not data:
+                    break
+                    
+                message = json.loads(data.decode())
+                self.process_message(message, client_socket, peer_ip)
+                
+        except Exception as e:
+            pass
+        finally:
+            with self.lock:
+                if peer_ip in self.peers:
+                    del self.peers[peer_ip]
+            client_socket.close()
+            
+    def process_message(self, msg, sock, peer_ip):
+        msg_type = msg.get('type')
+        
+        if msg_type == 'hello':
+            peer_name = msg.get('username')
+            print(f"{C['ok']}[+] نظير جديد: {peer_name} ({peer_ip}){C['reset']}")
+            with self.lock:
+                self.peers[peer_ip] = (sock, time.time())
+                
+            self.send_available_files(sock)
+            self.send_available_notes(sock, peer_ip)
+            
+        elif msg_type == 'file_list':
+            files = msg.get('files', [])
+            print(f"{C['file']}[📁] ملفات متاحة من {peer_ip}:{C['reset']}")
+            for f in files:
+                print(f"    - {f}")
+                
+        elif msg_type == 'file_request':
+            filename = msg.get('filename')
+            self.send_file(sock, filename, peer_ip)
+            
+        elif msg_type == 'file_data':
+            filename = msg.get('filename')
+            file_data = msg.get('data').encode('latin1')
+            sender = msg.get('sender', peer_ip)
+            self.save_received_file(filename, file_data, sender)
+            
+        elif msg_type == 'note_share':
+            note_title = msg.get('title')
+            note_content = msg.get('content')
+            sender = msg.get('sender', peer_ip)
+            self.save_note(note_title, note_content, sender)
+            
+        elif msg_type == 'note_list':
+            notes = msg.get('notes', [])
+            print(f"{C['note']}[📝] ملاحظات متاحة من {peer_ip}:{C['reset']}")
+            for title, content in notes:
+                print(f"    - {title}: {content[:50]}...")
+                
+        elif msg_type == 'chat_message':
+            sender = msg.get('sender')
+            text = msg.get('text')
+            print(f"\n{C['msg']}[{sender}] يقول: {text}{C['reset']}")
+            
+    def send_available_files(self, sock):
+        files = os.listdir(self.shared_dir)
+        msg = {
+            'type': 'file_list',
+            'files': files
+        }
+        self.send_message(sock, msg)
+        
+    def send_available_notes(self, sock, peer_ip):
+        notes = self.get_my_notes()
+        msg = {
+            'type': 'note_list',
+            'notes': notes
+        }
+        self.send_message(sock, msg)
+        
+    def get_my_notes(self):
+        notes = []
+        for filename in os.listdir(self.notes_dir):
+            if filename.endswith('.txt'):
+                filepath = os.path.join(self.notes_dir, filename)
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                notes.append((filename.replace('.txt', ''), content[:100]))
+        return notes
+        
+    def start_broadcast(self):
+        print(f"{C['info']}[🔍] جاري البحث عن طلاب آخرين...{C['reset']}")
+        
+        broadcast_port = self.port + 1
+        discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        discovery_socket.settimeout(2)
+        
+        discovery_msg = json.dumps({'type': 'discover', 'username': self.username})
+        
+        for _ in range(3):
+            try:
+                discovery_socket.sendto(discovery_msg.encode(), ('<broadcast>', broadcast_port))
+            except:
+                pass
+                
+        while True:
+            try:
+                data, addr = discovery_socket.recvfrom(1024)
+                peer_ip = addr[0]
+                if peer_ip != self.get_local_ip():
+                    self.connect_to_peer(peer_ip)
+            except socket.timeout:
+                break
+            except:
+                pass
+                
+        discovery_socket.close()
+        
+    def connect_to_peer(self, peer_ip):
+        if peer_ip in self.peers:
+            return
+            
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((peer_ip, self.port))
+            
+            hello_msg = {
+                'type': 'hello',
+                'username': self.username
+            }
+            self.send_message(sock, hello_msg)
+            
+            with self.lock:
+                self.peers[peer_ip] = (sock, time.time())
+                
+            print(f"{C['ok']}[+] تم الاتصال بـ {peer_ip}{C['reset']}")
+            
+            peer_thread = threading.Thread(target=self.handle_peer, args=(sock, peer_ip), daemon=True)
+            peer_thread.start()
+            
+        except Exception as e:
+            print(f"{C['err']}[✗] فشل الاتصال بـ {peer_ip}: {e}{C['reset']}")
+            
+    def send_message(self, sock, message):
+        try:
+            data = json.dumps(message).encode()
+            data_size = f"{len(data):<10}".encode()
+            sock.send(data_size + data)
+            return True
+        except:
+            return False
+            
+    def send_file(self, sock, filename, requestor_ip):
+        filepath = os.path.join(self.shared_dir, filename)
+        if not os.path.exists(filepath):
+            print(f"{C['err']}[✗] الملف {filename} غير موجود{C['reset']}")
+            return
+            
+        with open(filepath, 'rb') as f:
+            file_content = f.read()
+            
+        msg = {
+            'type': 'file_data',
+            'filename': filename,
+            'data': file_content.decode('latin1'),
+            'sender': self.username
+        }
+        self.send_message(sock, msg)
+        print(f"{C['ok']}[✓] تم إرسال الملف {filename} إلى {requestor_ip}{C['reset']}")
+        
+    def save_received_file(self, filename, file_data, sender):
+        filepath = os.path.join(self.shared_dir, f"from_{sender}_{filename}")
+        with open(filepath, 'wb') as f:
+            f.write(file_data.encode('latin1'))
+        print(f"{C['ok']}[✓] تم استلام الملف {filename} من {sender}{C['reset']}")
+        
+    def request_file(self, peer_ip, filename):
+        if peer_ip not in self.peers:
+            print(f"{C['err']}[✗] غير متصل بـ {peer_ip}{C['reset']}")
+            return
+            
+        sock, _ = self.peers[peer_ip]
+        msg = {
+            'type': 'file_request',
+            'filename': filename
+        }
+        self.send_message(sock, msg)
+        print(f"{C['info']}[⏳] جاري طلب الملف {filename} من {peer_ip}...{C['reset']}")
+        
+    def share_file(self, filepath):
+        if not os.path.exists(filepath):
+            print(f"{C['err']}[✗] الملف غير موجود{C['reset']}")
+            return
+            
+        filename = os.path.basename(filepath)
+        dest_path = os.path.join(self.shared_dir, filename)
+        
+        import shutil
+        shutil.copy2(filepath, dest_path)
+        
+        print(f"{C['ok']}[✓] الملف {filename} أصبح متاحاً للمشاركة{C['reset']}")
+        
+    def create_note(self, title, content):
+        note_path = os.path.join(self.notes_dir, f"{title}.txt")
+        with open(note_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"{C['ok']}[✓] تم حفظ الملاحظة: {title}{C['reset']}")
+        
+    def share_note(self, title):
+        note_path = os.path.join(self.notes_dir, f"{title}.txt")
+        if not os.path.exists(note_path):
+            print(f"{C['err']}[✗] الملاحظة غير موجودة{C['reset']}")
+            return
+            
+        with open(note_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+        for peer_ip, (sock, _) in self.peers.items():
+            msg = {
+                'type': 'note_share',
+                'title': title,
+                'content': content,
+                'sender': self.username
+            }
+            self.send_message(sock, msg)
+            
+        print(f"{C['ok']}[✓] تم مشاركة الملاحظة '{title}' مع {len(self.peers)} طالب{C['reset']}")
+        
+    def save_note(self, title, content, sender):
+        note_path = os.path.join(self.notes_dir, f"from_{sender}_{title}.txt")
+        with open(note_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"{C['note']}[📝] ملاحظة جديدة من {sender}: {title}{C['reset']}")
+        
+    def send_chat(self, peer_ip, text):
+        if peer_ip not in self.peers:
+            print(f"{C['err']}[✗] غير متصل بـ {peer_ip}{C['reset']}")
+            return
+            
+        sock, _ = self.peers[peer_ip]
+        msg = {
+            'type': 'chat_message',
+            'sender': self.username,
+            'text': text
+        }
+        self.send_message(sock, msg)
+        
+    def broadcast_chat(self, text):
+        for peer_ip, (sock, _) in self.peers.items():
+            msg = {
+                'type': 'chat_message',
+                'sender': self.username,
+                'text': f"[بث] {text}"
+            }
+            self.send_message(sock, msg)
+        print(f"{C['ok']}[✓] تم بث رسالتك لـ {len(self.peers)} طالب{C['reset']}")
+        
+    def list_peers(self):
+        if not self.peers:
+            print(f"{C['info']}[ℹ] لا يوجد أقران متصلون{C['reset']}")
+        else:
+            print(f"{C['info']}[👥] الأقران المتصلون ({len(self.peers)}):{C['reset']}")
+            for i, (ip, _) in enumerate(self.peers.items(), 1):
+                print(f"    {i}. {ip}")
+                
+    def list_shared_files(self):
+        files = os.listdir(self.shared_dir)
+        if not files:
+            print(f"{C['info']}[ℹ] لا توجد ملفات للمشاركة{C['reset']}")
+        else:
+            print(f"{C['file']}[📁] ملفاتي المشتركة:{C['reset']}")
+            for f in files:
+                size = os.path.getsize(os.path.join(self.shared_dir, f))
+                print(f"    - {f} ({size} بايت)")
+                
+    def list_notes(self):
+        notes = []
+        for f in os.listdir(self.notes_dir):
+            if f.endswith('.txt'):
+                notes.append(f.replace('.txt', ''))
+        if not notes:
+            print(f"{C['info']}[ℹ] لا توجد ملاحظات{C['reset']}")
+        else:
+            print(f"{C['note']}[📝] ملاحظاتي:{C['reset']}")
+            for n in notes:
+                print(f"    - {n}")
+                
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return '127.0.0.1'
+            
+    def show_menu(self):
+        print("\n" + "="*50)
+        print(f"{C['info']}           P2P مشاركة الملفات والملاحظات{C['reset']}")
+        print("="*50)
+        print(f"{C['info']}1.{C['reset']} 🔍 اكتشاف طلاب جدد")
+        print(f"{C['info']}2.{C['reset']} 👥 عرض الأقران المتصلين")
+        print(f"{C['info']}3.{C['reset']} 📁 مشاركة ملف")
+        print(f"{C['info']}4.{C['reset']} 📥 طلب ملف من طالب")
+        print(f"{C['info']}5.{C['reset']} 📝 إنشاء ملاحظة")
+        print(f"{C['info']}6.{C['reset']} 📤 مشاركة ملاحظة")
+        print(f"{C['info']}7.{C['reset']} 💬 إرسال رسالة خاصة")
+        print(f"{C['info']}8.{C['reset']} 📢 بث رسالة للجميع")
+        print(f"{C['info']}9.{C['reset']} 📋 عرض ملفاتي المشتركة")
+        print(f"{C['info']}10.{C['reset']}📋 عرض ملاحظاتي")
+        print(f"{C['info']}0.{C['reset']} 🚪 خروج")
+        print("-"*50)
+        
+    def run(self):
+        os.system('clear' if os.name == 'posix' else 'cls')
+        print(f"{C['info']}╔══════════════════════════════════════════════════╗{C['reset']}")
+        print(f"{C['info']}║     نظام مشاركة الملفات والملاحظات بين الطلاب    ║{C['reset']}")
+        print(f"{C['info']}║                  Peer-to-Peer                    ║{C['reset']}")
+        print(f"{C['info']}╚══════════════════════════════════════════════════╝{C['reset']}")
+        
+        print(f"\n{C['ok']}مرحباً {self.username}!{C['reset']}")
+        print(f"{C['info']}عنوانك: {self.get_local_ip()}:{self.port}{C['reset']}")
+        
+        self.start_server()
+        
+        choice = input(f"\n{C['msg']}هل تريد البحث عن طلاب آخرين الآن؟ (y/n): {C['reset']}")
+        if choice.lower() == 'y':
+            self.start_broadcast()
+            
+        while self.running:
+            self.show_menu()
+            choice = input(f"{C['msg']}اختر خياراً: {C['reset']}")
+            
+            if choice == '1':
+                self.start_broadcast()
+                
+            elif choice == '2':
+                self.list_peers()
+                
+            elif choice == '3':
+                filepath = input("أدخل مسار الملف للمشاركة: ")
+                self.share_file(filepath)
+                
+            elif choice == '4':
+                self.list_peers()
+                if self.peers:
+                    peer_ip = input("أدخل IP الطالب: ")
+                    filename = input("أدخل اسم الملف المطلوب: ")
+                    self.request_file(peer_ip, filename)
+                    
+            elif choice == '5':
+                title = input("عنوان الملاحظة: ")
+                print("أدخل محتوى الملاحظة (اكتب 'END' في سطر منفصل للإنهاء):")
+                lines = []
+                while True:
+                    line = input()
+                    if line == 'END':
+                        break
+                    lines.append(line)
+                content = '\n'.join(lines)
+                self.create_note(title, content)
+                
+            elif choice == '6':
+                self.list_notes()
+                if os.listdir(self.notes_dir):
+                    title = input("أدخل عنوان الملاحظة للمشاركة: ")
+                    self.share_note(title)
+                    
+            elif choice == '7':
+                self.list_peers()
+                if self.peers:
+                    peer_ip = input("أدخل IP الطالب: ")
+                    text = input("الرسالة: ")
+                    self.send_chat(peer_ip, text)
+                    
+            elif choice == '8':
+                text = input("الرسالة للبث: ")
+                self.broadcast_chat(text)
+                
+            elif choice == '9':
+                self.list_shared_files()
+                
+            elif choice == '10':
+                self.list_notes()
+                
+            elif choice == '0':
+                print(f"{C['ok']}مع السلامة {self.username}!{C['reset']}")
+                self.running = False
+                break
+                
+            else:
+                print(f"{C['err']}خيار غير صحيح{C['reset']}")
+                
+            input("\nاضغط Enter للمتابعة...")
+            
+        self.server_socket.close()
+        
+def main():
+    os.system('clear' if os.name == 'posix' else 'cls')
+    print(f"{C['info']}══════════════════════════════════════════════════{C['reset']}")
+    print(f"{C['info']}     نظام P2P لمشاركة الملفات والملاحظات{C['reset']}")
+    print(f"{C['info']}══════════════════════════════════════════════════{C['reset']}")
+    
+    username = input(f"{C['msg']}أدخل اسم المستخدم: {C['reset']}")
+    port = input(f"{C['msg']}أدخل رقم المنفذ (Enter للمنفذ الافتراضي 5555): {C['reset']}")
+    
+    if not port:
+        port = 5555
+    else:
+        port = int(port)
+        
+    node = P2PStudentShare(username=username, port=port)
+    
+    try:
+        node.run()
+    except KeyboardInterrupt:
+        print(f"\n{C['ok']}تم الإنهاء...{C['reset']}")
+    
+if __name__ == "__main__":
+    main()
